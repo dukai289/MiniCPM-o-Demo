@@ -22,37 +22,15 @@ for arg in "$@"; do
     esac
 done
 
-# ============ Configuration ============
+# ============ 配置 ============
+# 从 config.py 读取端口配置
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
-DEFAULT_VENV_PYTHON="$PROJECT_DIR/.venv/base/bin/python"
-EXTERNAL_VENV_PYTHON="/data/dukai_uv_cache/realtime/bin/python"
-VENV_PYTHON="${VENV_PYTHON:-}"
-
-if [ -z "$VENV_PYTHON" ]; then
-    if [ -x "$DEFAULT_VENV_PYTHON" ]; then
-        VENV_PYTHON="$DEFAULT_VENV_PYTHON"
-    elif [ -x "$EXTERNAL_VENV_PYTHON" ]; then
-        VENV_PYTHON="$EXTERNAL_VENV_PYTHON"
-    fi
-fi
-
-if [ -z "$VENV_PYTHON" ] || [ ! -x "$VENV_PYTHON" ]; then
-    echo "ERROR: Python interpreter for the project was not found."
-    echo "Looked for:"
-    echo "  1. VENV_PYTHON from environment"
-    echo "  2. $DEFAULT_VENV_PYTHON"
-    echo "  3. $EXTERNAL_VENV_PYTHON"
-    echo ""
-    echo "Examples:"
-    echo "  VENV_PYTHON=/data/dukai_uv_cache/realtime/bin/python bash start_all.sh"
-    echo "  ln -s /data/dukai_uv_cache/realtime $PROJECT_DIR/.venv/base"
-    exit 1
-fi
+VENV_PYTHON="$PROJECT_DIR/.venv/base/bin/python"
 
 GATEWAY_PORT=$($VENV_PYTHON -c "import sys; sys.path.insert(0,'$PROJECT_DIR'); from config import get_config; print(get_config().gateway_port)" 2>/dev/null || echo "10024")
 WORKER_BASE_PORT=$($VENV_PYTHON -c "import sys; sys.path.insert(0,'$PROJECT_DIR'); from config import get_config; print(get_config().worker_base_port)" 2>/dev/null || echo "22400")
 
-# ============ Detect GPUs ============
+# ============ 检测 GPU ============
 if [ -z "$CUDA_VISIBLE_DEVICES" ]; then
     NUM_GPUS=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)
     GPU_LIST=$(seq 0 $((NUM_GPUS - 1)) | tr '\n' ',' | sed 's/,$//')
@@ -64,7 +42,6 @@ fi
 echo "=================================================="
 echo "  MiniCPMO45 Service Launcher"
 echo "=================================================="
-echo "  Python: $VENV_PYTHON"
 echo "  GPUs: $GPU_LIST ($NUM_GPUS)"
 echo "  Gateway: ${GATEWAY_PROTO}://localhost:$GATEWAY_PORT"
 echo "  Workers: localhost:$WORKER_BASE_PORT ~ localhost:$((WORKER_BASE_PORT + NUM_GPUS - 1)) (HTTP, internal)"
@@ -73,7 +50,7 @@ echo "=================================================="
 cd "$PROJECT_DIR"
 mkdir -p tmp
 
-# ============ Start Workers ============
+# ============ 启动 Workers ============
 WORKER_ADDRS=""
 GPU_IDX=0
 
@@ -102,117 +79,28 @@ done
 echo ""
 echo "Waiting for Workers to load models (~30-90s)..."
 
-print_worker_health() {
-    local worker_idx="$1"
-    local worker_port="$2"
-    local worker_pid_file="tmp/worker_${worker_idx}.pid"
-    local worker_log_file="tmp/worker_${worker_idx}.log"
-
-    local worker_pid=""
-    if [ -f "$worker_pid_file" ]; then
-        worker_pid=$(cat "$worker_pid_file" 2>/dev/null)
-    fi
-
-    local pid_state="unknown"
-    if [ -n "$worker_pid" ]; then
-        if kill -0 "$worker_pid" 2>/dev/null; then
-            pid_state="alive(pid=$worker_pid)"
-        else
-            pid_state="dead(pid=$worker_pid)"
-        fi
-    fi
-
-    local health_json
-    health_json=$(curl -s --max-time 2 "http://localhost:$worker_port/health" 2>/dev/null || true)
-    if [ -n "$health_json" ]; then
-        local parsed
-        parsed=$($VENV_PYTHON -c 'import sys, json
-try:
-    d = json.load(sys.stdin)
-    print(
-        "reachable status={status} worker_status={worker_status} model_loaded={model_loaded} "
-        "gpu_id={gpu_id} requests={requests} avg_ms={avg_ms}".format(
-            status=d.get("status", "?"),
-            worker_status=d.get("worker_status", "?"),
-            model_loaded=d.get("model_loaded", False),
-            gpu_id=d.get("gpu_id", "?"),
-            requests=d.get("total_requests", 0),
-            avg_ms=round(float(d.get("avg_inference_time_ms", 0.0) or 0.0), 1),
-        )
-    )
-except Exception as e:
-    print(f"health-parse-error={e}")' <<< "$health_json" 2>/dev/null || echo "health-parse-error")
-        echo "  [Worker $worker_idx:$worker_port] $parsed | $pid_state"
-    else
-        echo "  [Worker $worker_idx:$worker_port] unreachable | $pid_state"
-    fi
-
-    if [ -f "$worker_log_file" ]; then
-        local last_log
-        last_log=$(tail -n 2 "$worker_log_file" 2>/dev/null | sed 's/^/      log> /')
-        if [ -n "$last_log" ]; then
-            echo "$last_log"
-        fi
-    fi
-}
-
-sleep 2
-MAX_RETRIES=3000
-STATUS_INTERVAL=5
-LAST_STATUS_RETRY=-1
-
+# 等待所有 Worker 就绪
+sleep 5
 for i in $(seq 0 $((NUM_GPUS - 1))); do
-    eval "WORKER_READY_$i=0"
-done
+    WORKER_PORT=$((WORKER_BASE_PORT + i))
+    MAX_RETRIES=3000
+    RETRY=0
 
-for RETRY in $(seq 0 $MAX_RETRIES); do
-    READY_COUNT=0
-
-    for i in $(seq 0 $((NUM_GPUS - 1))); do
-        WORKER_PORT=$((WORKER_BASE_PORT + i))
-        if curl -s --max-time 2 "http://localhost:$WORKER_PORT/health" 2>/dev/null | $VENV_PYTHON -c "import sys,json; d=json.load(sys.stdin); exit(0 if d.get('model_loaded') else 1)" 2>/dev/null; then
-            eval "IS_READY=\$WORKER_READY_$i"
-            if [ "$IS_READY" -eq 0 ]; then
-                echo "[Worker $i] Ready on port $WORKER_PORT"
-                eval "WORKER_READY_$i=1"
-            fi
-            READY_COUNT=$((READY_COUNT + 1))
+    while [ $RETRY -lt $MAX_RETRIES ]; do
+        if curl -s "http://localhost:$WORKER_PORT/health" 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if d.get('model_loaded') else 1)" 2>/dev/null; then
+            echo "[Worker $i] Ready ✓ (port $WORKER_PORT)"
+            break
         fi
+        RETRY=$((RETRY + 1))
+        sleep 2
     done
 
-    if [ "$READY_COUNT" -eq "$NUM_GPUS" ]; then
-        echo "All workers are ready."
-        break
-    fi
-
-    if [ "$RETRY" -eq "$MAX_RETRIES" ]; then
-        break
-    fi
-
-    if [ $((RETRY % STATUS_INTERVAL)) -eq 0 ] && [ "$LAST_STATUS_RETRY" -ne "$RETRY" ]; then
-        ELAPSED_S=$((RETRY * 2))
-        echo ""
-        echo "[Wait] ${READY_COUNT}/${NUM_GPUS} workers ready after ~${ELAPSED_S}s"
-        for i in $(seq 0 $((NUM_GPUS - 1))); do
-            WORKER_PORT=$((WORKER_BASE_PORT + i))
-            print_worker_health "$i" "$WORKER_PORT"
-        done
-        echo ""
-        LAST_STATUS_RETRY=$RETRY
-    fi
-
-    sleep 2
-done
-
-for i in $(seq 0 $((NUM_GPUS - 1))); do
-    eval "IS_READY=\$WORKER_READY_$i"
-    if [ "$IS_READY" -eq 0 ]; then
-        WORKER_PORT=$((WORKER_BASE_PORT + i))
-        echo "[Worker $i] FAILED to become ready on port $WORKER_PORT. Check tmp/worker_${i}.log"
+    if [ $RETRY -eq $MAX_RETRIES ]; then
+        echo "[Worker $i] FAILED to start! Check tmp/worker_${i}.log"
     fi
 done
 
-# ============ Start Gateway ============
+# ============ 启动 Gateway ============
 echo ""
 echo "[Gateway] Starting on port $GATEWAY_PORT..."
 
@@ -228,11 +116,11 @@ sleep 2
 
 CURL_FLAGS=""
 if [ "$GATEWAY_PROTO" = "https" ]; then
-    CURL_FLAGS="-k"
+    CURL_FLAGS="-k"  # 自签名证书跳过验证
 fi
 
-if curl -s $CURL_FLAGS "${GATEWAY_PROTO}://localhost:$GATEWAY_PORT/health" 2>/dev/null | $VENV_PYTHON -c "import sys,json; json.load(sys.stdin); exit(0)" 2>/dev/null; then
-    echo "[Gateway] Ready"
+if curl -s $CURL_FLAGS "${GATEWAY_PROTO}://localhost:$GATEWAY_PORT/health" 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0)" 2>/dev/null; then
+    echo "[Gateway] Ready ✓"
 else
     echo "[Gateway] May still be starting. Check tmp/gateway.log"
 fi
