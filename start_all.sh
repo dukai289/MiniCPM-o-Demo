@@ -24,7 +24,30 @@ done
 
 # ============ Configuration ============
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
-VENV_PYTHON="/data/dukai_venvs/realtime/bin/python"
+DEFAULT_VENV_PYTHON="$PROJECT_DIR/.venv/base/bin/python"
+EXTERNAL_VENV_PYTHON="/data/dukai_uv_cache/realtime/bin/python"
+VENV_PYTHON="${VENV_PYTHON:-}"
+
+if [ -z "$VENV_PYTHON" ]; then
+    if [ -x "$DEFAULT_VENV_PYTHON" ]; then
+        VENV_PYTHON="$DEFAULT_VENV_PYTHON"
+    elif [ -x "$EXTERNAL_VENV_PYTHON" ]; then
+        VENV_PYTHON="$EXTERNAL_VENV_PYTHON"
+    fi
+fi
+
+if [ -z "$VENV_PYTHON" ] || [ ! -x "$VENV_PYTHON" ]; then
+    echo "ERROR: Python interpreter for the project was not found."
+    echo "Looked for:"
+    echo "  1. VENV_PYTHON from environment"
+    echo "  2. $DEFAULT_VENV_PYTHON"
+    echo "  3. $EXTERNAL_VENV_PYTHON"
+    echo ""
+    echo "Examples:"
+    echo "  VENV_PYTHON=/data/dukai_uv_cache/realtime/bin/python bash start_all.sh"
+    echo "  ln -s /data/dukai_uv_cache/realtime $PROJECT_DIR/.venv/base"
+    exit 1
+fi
 
 GATEWAY_PORT=$($VENV_PYTHON -c "import sys; sys.path.insert(0,'$PROJECT_DIR'); from config import get_config; print(get_config().gateway_port)" 2>/dev/null || echo "10024")
 WORKER_BASE_PORT=$($VENV_PYTHON -c "import sys; sys.path.insert(0,'$PROJECT_DIR'); from config import get_config; print(get_config().worker_base_port)" 2>/dev/null || echo "22400")
@@ -41,6 +64,7 @@ fi
 echo "=================================================="
 echo "  MiniCPMO45 Service Launcher"
 echo "=================================================="
+echo "  Python: $VENV_PYTHON"
 echo "  GPUs: $GPU_LIST ($NUM_GPUS)"
 echo "  Gateway: ${GATEWAY_PROTO}://localhost:$GATEWAY_PORT"
 echo "  Workers: localhost:$WORKER_BASE_PORT ~ localhost:$((WORKER_BASE_PORT + NUM_GPUS - 1)) (HTTP, internal)"
